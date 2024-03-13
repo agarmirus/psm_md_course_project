@@ -1,0 +1,819 @@
+#include <linux/slab.h>
+#include <linux/mutex.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/ftrace.h>
+#include <linux/proc_fs.h>
+#include <linux/kprobes.h>
+#include <linux/moduleparam.h>
+
+#ifdef CONFIG_SLAB
+#include <linux/slab_def.h>
+#endif
+
+#ifdef CONFIG_SLUB
+/* 
+typedefs and defines from mm/slab.h for SLUB
+struct kmem_cache from linux/slub_def.h
+*/
+typedef u128 freelist_full_t;
+
+typedef union {
+    struct {
+        void *freelist;
+        unsigned long counter;
+    };
+    freelist_full_t full;
+} freelist_aba_t;
+
+/*
+defines from mm/slub.h
+*/
+#define OO_SHIFT 16
+#define OO_MASK ((1 << OO_SHIFT) - 1)
+
+#include <linux/slub_def.h>
+#endif
+
+#define PROC_FILE_NAME "procslabinfo"
+
+#define DEFAULT_TRACED_PIDS_COUNT 10
+#define DEFAULT_PROC_SLAB_INFO_COUNT 50
+
+MODULE_LICENSE("GPL");
+
+struct traced_pids_array
+{
+    size_t buf_size;
+    size_t length;
+
+    pid_t *arr;
+};
+
+struct proc_slab_info
+{
+    pid_t pid;
+
+    const char *cache_name;
+
+    size_t num_objs;
+    size_t obj_size;
+
+    size_t objs_per_slab;
+    size_t pages_per_slab;
+};
+
+struct proc_slab_info_array
+{
+    size_t buf_size;
+    size_t length;
+
+    struct proc_slab_info *arr;
+};
+
+struct ftrace_hook
+{
+    const char *name;
+    void *function;
+    void *original;
+
+    unsigned long address;
+    struct ftrace_ops ops;
+};
+
+static struct traced_pids_array tr_pid_array = {0, 0, NULL};
+static struct proc_slab_info_array psi_array = {0, 0, NULL};
+
+static unsigned long lookup_name(const char *name)
+{
+    struct kprobe kp =
+    {
+        .symbol_name = name
+    };
+
+    unsigned long retval;
+
+    if (register_kprobe(&kp) < 0)
+        return 0;
+
+    retval = (unsigned long) kp.addr;
+
+    unregister_kprobe(&kp);
+
+    return retval;
+}
+
+/***********************************
+   struct kmem_cache data access
+***********************************/
+
+static const char *get_kmem_cache_name(const struct kmem_cache *const cachep)
+{
+#ifdef CONFIG_SLAB
+    return cachep->name;
+#endif
+
+#ifdef CONFIG_SLUB
+    return cachep->name;
+#endif
+}
+
+static size_t get_kmem_cache_object_size(const struct kmem_cache *const cachep)
+{
+#ifdef CONFIG_SLAB
+    return (size_t)cachep->object_size;
+#endif
+
+#ifdef CONFIG_SLUB
+    return (size_t)cachep->object_size;
+#endif
+}
+
+// TODO: objects count sometimes is very big
+static size_t get_kmem_cache_objs_per_slab(const struct kmem_cache *const cachep)
+{
+#ifdef CONFIG_SLAB
+    return cachep->num;
+#endif
+
+#ifdef CONFIG_SLUB
+    return (size_t)(cachep->oo.x) & OO_MASK;
+#endif
+}
+
+static size_t get_kmem_cache_pages_per_slab(const struct kmem_cache *const cachep)
+{
+#ifdef CONFIG_SLAB
+    return (size_t)int_pow(2, cachep->gfporder);
+#endif
+
+#ifdef CONFIG_SLUB
+    size_t objs_per_slab = get_kmem_cache_objs_per_slab(cachep);
+    size_t slab_size = objs_per_slab * (size_t)cachep->size;
+
+    return slab_size / PAGE_SIZE + (slab_size % PAGE_SIZE > 0);
+#endif
+}
+
+/***********************************
+   proc_slab_info_array operations
+***********************************/
+
+static int init_psi_array(void)
+{
+    if (!(psi_array.arr = kmalloc(DEFAULT_PROC_SLAB_INFO_COUNT * sizeof(struct proc_slab_info), GFP_KERNEL)))
+        return -ENOMEM;
+
+    psi_array.buf_size = DEFAULT_PROC_SLAB_INFO_COUNT * sizeof(struct proc_slab_info);
+
+    return 0;
+}
+
+static int proc_slab_info_ind(const pid_t pid, const char *cache_name)
+{
+    int i = 0;
+    int found = 0;
+
+    while (i < psi_array.length && !found)
+    {
+        bool pids_are_equal = psi_array.arr[i].pid == pid;
+        bool cache_names_are_equal = strcmp(cache_name, psi_array.arr[i].cache_name) == 0;
+
+        if (pids_are_equal && cache_names_are_equal)
+            found = 1;
+        else
+            ++i;
+    }
+
+    return i < psi_array.length ? i : -1;
+}
+
+static int add_proc_slab_info(const struct proc_slab_info *const new_psi)
+{
+    if (psi_array.length >= psi_array.buf_size)
+    {
+        struct proc_slab_info *new_arr = krealloc(psi_array.arr, 2 * psi_array.buf_size * sizeof(struct proc_slab_info), GFP_KERNEL);
+
+        if (!new_arr)
+        {
+            printk(KERN_ERR "psm_md: cannot reallocate memory for proc slab info array\n");
+
+            return -ENOMEM;
+        }
+
+        psi_array.buf_size *= 2 * sizeof(struct proc_slab_info);
+        psi_array.arr = new_arr;
+    }
+
+    psi_array.arr[psi_array.length++] = *new_psi;
+
+    return 0;
+}
+
+static void remove_proc_slab_info_by_pid(const pid_t pid)
+{
+    for (int i = 0; i < psi_array.length;)
+    {
+        if (psi_array.arr[i].pid == pid)
+        {
+            for (int j = i; j < psi_array.length - 1; ++j)
+                psi_array.arr[j] = psi_array.arr[j + 1];
+            
+            --psi_array.length;
+        }
+        else
+            ++i;
+    }
+}
+
+static void free_proc_slab_info_array(void)
+{
+    kfree(psi_array.arr);
+    psi_array.arr = NULL;
+}
+
+/***********************************
+    traced_pids_array operations
+***********************************/
+
+static int init_tr_pid_array(void)
+{
+    if (!(tr_pid_array.arr = kmalloc(DEFAULT_TRACED_PIDS_COUNT * sizeof(pid_t), GFP_KERNEL)))
+        return -ENOMEM;
+
+    tr_pid_array.buf_size = DEFAULT_TRACED_PIDS_COUNT * sizeof(pid_t);
+
+    return 0;
+}
+
+static int traced_pid_ind(const pid_t pid)
+{
+    int i = 0;
+
+    for (; i < tr_pid_array.length && tr_pid_array.arr[i] != pid; ++i);
+
+    return i < tr_pid_array.length ? i : -1;
+}
+
+static void remove_traced_pid(const pid_t pid)
+{
+    int i = traced_pid_ind(pid);
+
+    if (i != -1)
+    {
+        remove_proc_slab_info_by_pid(pid);
+
+        for (int j = i; j < tr_pid_array.length - 1; ++j)
+            tr_pid_array.arr[j] = tr_pid_array.arr[j + 1];
+
+        --tr_pid_array.length;
+    }
+}
+
+static int add_traced_pid(const pid_t pid)
+{
+    int i = traced_pid_ind(pid);
+
+    if (i == -1)
+    {
+        printk(KERN_INFO "psm_md: pid %d not found, adding", pid);
+
+        if (tr_pid_array.length >= tr_pid_array.buf_size)
+        {
+            pid_t *new_arr = krealloc(tr_pid_array.arr, 2 * tr_pid_array.buf_size * sizeof(pid_t), GFP_KERNEL);
+
+            if (!new_arr)
+            {
+                printk(KERN_ERR "psm_md: cannot reallocate memory for traced pids array\n");
+
+                return -ENOMEM;
+            }
+
+            tr_pid_array.buf_size *= 2 * sizeof(pid_t);
+            tr_pid_array.arr = new_arr;
+        }
+
+        tr_pid_array.arr[tr_pid_array.length++] = pid;
+    }
+
+    return 0;
+}
+
+static void free_traced_pid_array(void)
+{
+    kfree(tr_pid_array.arr);
+    tr_pid_array.arr = NULL;
+}
+
+/***********************************
+              Fortunes
+***********************************/
+
+static int psm_open(struct inode *sp_inode, struct file *sp_file)
+{
+    printk(KERN_INFO "psm_md: open has been called (PID %d)\n", current->pid);
+
+    return 0;
+}
+
+static int psm_release(struct inode *sp_inode, struct file *sp_file)
+{
+    printk(KERN_INFO "psm_md: release has been called (PID %d)\n", current->pid);
+
+    return 0;
+}
+
+static ssize_t psm_write(struct file *file, const char __user *buf, size_t len, loff_t *fPos)
+{
+    printk(KERN_INFO "psm_md: write has been called (PID %d)\n", current->pid);
+
+    char tmp_buf[10] = {0};
+
+    if (copy_from_user(tmp_buf, buf, len) == -1)
+    {
+        printk(KERN_ERR "psm_md: copy_from_user error (PID %d)\n", current->pid);
+
+        return -EFAULT;
+    }
+
+    pid_t pid = -1;
+
+    printk(KERN_INFO "psm_md: parsing input string (PID %d)\n", current->pid);
+
+    if (tmp_buf[0] == 'r')
+    {
+        int rc = kstrtol(tmp_buf + 1, 10, (long *)&pid);
+
+        if (rc != 0)
+        {
+            printk(KERN_ERR "psm_md: invalid pid\n");
+
+            return -EIO;
+        }
+
+        printk(KERN_INFO "psm_md: removing pid %d (PID %d)\n", pid, current->pid);
+
+        remove_traced_pid(pid);
+    }
+    else
+    {
+        int rc = kstrtol(tmp_buf, 10, (long *)&pid);
+
+        if (rc != 0)
+        {
+            printk(KERN_ERR "psm_md: invalid pid\n");
+
+            return -EIO;
+        }
+
+        printk(KERN_INFO "psm_md: adding pid %d (PID %d)\n", pid, current->pid);
+
+        rc = add_traced_pid(pid);
+
+        if (rc != 0)
+        {
+            printk(KERN_ERR "psm_md: error while adding traced pid\n");
+
+            return -ENOMEM;
+        }
+    }
+
+    return len;
+}
+
+static ssize_t psm_read(struct file *file, char __user *buf, size_t len, loff_t *fPos)
+{
+    printk(KERN_INFO "psm_md: read has been called (PID %d)\n", current->pid);
+
+    if (*fPos >= psi_array.length)
+        return 0;
+
+    char line_buf[500] = {0};
+
+    pid_t pid = psi_array.arr[*fPos].pid;
+    const char *cache_name = psi_array.arr[*fPos].cache_name;
+    size_t num_objs = psi_array.arr[*fPos].num_objs;
+    size_t objs_per_slab = psi_array.arr[*fPos].objs_per_slab;
+    size_t pages_per_slab = psi_array.arr[*fPos].pages_per_slab;
+    size_t obj_size = psi_array.arr[*fPos].obj_size;
+
+    size_t slabs_count = num_objs / objs_per_slab + (num_objs % objs_per_slab > 0);
+    size_t total_pages = slabs_count * pages_per_slab;
+
+    if (*fPos == 0)
+        sprintf(
+            line_buf,
+            "pid   "
+            "name                 "
+            "num_objs   "
+            "obj_size   "
+            "objs_per_slab "
+            "pages_per_slab "
+            "total_pages\n"
+            "%-5d %-20s %-10zu %-10zu %-13zu %-15zu %-11zu\n",
+            pid,
+            cache_name,
+            num_objs,
+            obj_size,
+            objs_per_slab,
+            pages_per_slab,
+            total_pages
+        );
+    else
+        sprintf(
+            line_buf,
+            "%-5d %-20s %-10zu %-10zu %-13zu %-15zu %-11zu\n",
+            pid,
+            cache_name,
+            num_objs,
+            obj_size,
+            objs_per_slab,
+            pages_per_slab,
+            total_pages
+        );
+
+    if (copy_to_user(buf, line_buf, strlen(line_buf) + 1) == -1)
+    {
+        printk(KERN_ERR "psm_md: copy_to_user error\n");
+
+        return -EFAULT;
+    }
+
+    ++(*fPos);
+
+    return strlen(line_buf) + 1;
+}
+
+/***********************************
+              ftrace
+***********************************/
+
+static void notrace ftrace_callback(unsigned long ip, unsigned long parent_ip, struct ftrace_ops *ops, struct ftrace_regs *fregs)
+{
+    struct pt_regs *regs = ftrace_get_regs(fregs);
+    struct ftrace_hook *hook = container_of(ops, struct ftrace_hook, ops);
+
+    if (!within_module(parent_ip, THIS_MODULE))
+        regs->ip = (unsigned long)hook->function;
+}
+
+static int fh_resolve_hook_address(struct ftrace_hook *hook)
+{
+    hook->address = lookup_name(hook->name);
+
+    if (!hook->address)
+    {
+        printk(KERN_ERR "psm_md: unresolved symbol (%s) in lookup_name\n", hook->name);
+
+        return -ENOENT;
+    }
+
+    *((unsigned long*) hook->original) = hook->address;
+
+    return 0;
+}
+
+static int fh_install_hook(struct ftrace_hook *hook)
+{
+    int rc = fh_resolve_hook_address(hook);
+
+    if (rc != 0)
+        return rc;
+
+    hook->ops.func = ftrace_callback;
+    hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_IPMODIFY;
+
+    rc = ftrace_set_filter_ip(&hook->ops, hook->address, 0, 0);
+
+    if (rc != 0)
+    {
+        printk(KERN_ERR "psm_md: ftrace_set_filter_ip failed with code %d\n", rc);
+
+        return rc;
+    }
+
+    rc = register_ftrace_function(&hook->ops);
+
+    if (rc != 0)
+    {
+        printk(KERN_ERR "psm_md: register_ftrace_function failed with code %d\n", rc);
+
+        ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+
+        return rc;
+    }
+
+    return 0;
+}
+
+void fh_remove_hook(struct ftrace_hook *hook)
+{
+    int rc = unregister_ftrace_function(&hook->ops);
+
+    if (rc != 0)
+        printk(KERN_ERR "psm_md: unregister_ftrace_function failed with code %d\n", rc);
+
+    rc = ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+
+    if (rc != 0)
+        printk(KERN_ERR "psm_md: ftrace_set_filter_ip failed with code %d\n", rc);
+}
+
+int fh_install_hooks(struct ftrace_hook *hooks, size_t count)
+{
+    int rc;
+    size_t i;
+
+    for (i = 0; i < count; i++)
+    {
+        rc = fh_install_hook(&hooks[i]);
+
+        if (rc != 0)
+        {
+            while (i != 0)
+                fh_remove_hook(&hooks[--i]);
+
+            return rc;
+        }
+    }
+
+    return 0;
+}
+
+void fh_remove_hooks(struct ftrace_hook *hooks, size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++)
+        fh_remove_hook(&hooks[i]);
+}
+
+static void commit_kmem_cache_alloc(
+    const struct kmem_cache *const cachep
+)
+{
+    const char *cache_name = get_kmem_cache_name(cachep);
+
+    int ind = proc_slab_info_ind(current->pid, cache_name);
+
+    if (ind == -1)
+    {
+        struct proc_slab_info new_psi =
+        {
+            .pid = current->pid,
+            .cache_name = cache_name,
+            .num_objs = 0,
+            .obj_size = get_kmem_cache_object_size(cachep),
+            .objs_per_slab = get_kmem_cache_objs_per_slab(cachep),
+            .pages_per_slab = get_kmem_cache_pages_per_slab(cachep)
+        };
+        
+        if (add_proc_slab_info(&new_psi) != 0)
+            return;
+
+        ind = psi_array.length - 1;
+    }
+
+    ++psi_array.arr[ind].num_objs;
+}
+
+static void commit_kmem_cache_free(const struct kmem_cache *const cachep)
+{
+    const char *cache_name = get_kmem_cache_name(cachep);
+
+    int ind = proc_slab_info_ind(current->pid, cache_name);
+
+    if (ind != -1 && psi_array.arr[ind].num_objs > 0)
+        --psi_array.arr[ind].num_objs;
+}
+
+static void commit_kmem_cache_destroy(struct kmem_cache *cachep)
+{
+    size_t i = 0;
+
+    while (i < psi_array.length)
+    {
+        if (strcmp(psi_array.arr[i].cache_name, get_kmem_cache_name(cachep)) == 0)
+        {
+            for (size_t j = i; j < psi_array.length; ++j)
+                psi_array.arr[j] = psi_array.arr[i + 1];
+
+            --psi_array.length;
+        }
+        else
+            ++i;
+    }
+}
+
+static void *(*real_in_kmem_cache_alloc_node)(
+    struct kmem_cache *,
+    gfp_t,
+    int,
+    size_t,
+    unsigned long
+);
+
+static void *fh_in_kmem_cache_alloc_node(
+    struct kmem_cache *cachep,
+    gfp_t flags,
+    int nodeid,
+    size_t orig_size,
+    unsigned long caller
+)
+{
+    void *ret = real_in_kmem_cache_alloc_node(cachep, flags, nodeid, orig_size, caller);
+    
+    if (traced_pid_ind(current->pid) != -1)
+    {
+        printk(KERN_INFO "psm_md: catched __kmem_cache_alloc_node call from %d\n", current->pid);
+
+        if (ret)
+            commit_kmem_cache_alloc(cachep);
+    }
+
+    return ret;
+}
+
+static void (*real_in_kmem_cache_free)(
+    struct kmem_cache *,
+    void *,
+    unsigned long
+);
+
+static void fh_in_kmem_cache_free(
+    struct kmem_cache *cachep,
+    void *objp,
+    unsigned long caller
+)
+{
+    real_in_kmem_cache_free(cachep, objp, caller);
+
+    if (traced_pid_ind(current->pid) != -1)
+    {
+        printk(KERN_INFO "psm_md: catched __kmem_cache_free call from %d\n", current->pid);
+
+        if (objp)
+            commit_kmem_cache_free(cachep);
+    }
+}
+
+static void *(*real_kmem_cache_alloc)(struct kmem_cache *, gfp_t);
+
+static void *fh_kmem_cache_alloc(struct kmem_cache *cachep, gfp_t flags)
+{
+    void *ret = real_kmem_cache_alloc(cachep, flags);
+
+    if (traced_pid_ind(current->pid) != -1)
+    {
+        printk(KERN_INFO "psm_md: catched kmem_cache_alloc call from %d\n", current->pid);
+
+        if (ret)
+            commit_kmem_cache_alloc(cachep);
+    }
+
+    return ret;
+}
+
+static void (*real_kmem_cache_free)(struct kmem_cache *, void *);
+
+static void fh_kmem_cache_free(struct kmem_cache *cachep, void *objp)
+{
+    real_kmem_cache_free(cachep, objp);
+
+    if (traced_pid_ind(current->pid) != -1)
+    {
+        printk(KERN_INFO "psm_md: catched kmem_cache_free call from %d\n", current->pid);
+
+        if (objp)
+            commit_kmem_cache_free(cachep);
+    }
+}
+
+static void (*real_kmem_cache_destroy)(struct kmem_cache *);
+
+static void fh_kmem_cache_destroy(struct kmem_cache *cachep)
+{
+    real_kmem_cache_destroy(cachep);
+
+    printk(KERN_INFO "psm_md: catched kmem_cache_destroy call from %d\n", current->pid);
+
+    if (cachep)
+        commit_kmem_cache_destroy(cachep);
+}
+
+static struct ftrace_hook hooks[] =
+{
+    {
+        .name = "kmem_cache_alloc",
+        .function = fh_kmem_cache_alloc,
+        .original = &real_kmem_cache_alloc
+    },
+    {
+        .name = "kmem_cache_free",
+        .function = fh_kmem_cache_free,
+        .original = &real_kmem_cache_free
+    },
+    {
+        .name = "__kmem_cache_alloc_node",
+        .function = fh_in_kmem_cache_alloc_node,
+        .original = &real_in_kmem_cache_alloc_node
+    },
+    {
+        .name = "__kmem_cache_free",
+        .function = fh_in_kmem_cache_free,
+        .original = &real_in_kmem_cache_free
+    },
+    {
+        .name = "kmem_cache_destroy",
+        .function = fh_kmem_cache_destroy,
+        .original = &real_kmem_cache_destroy
+    }
+};
+
+/***********************************
+          Module init/exit
+***********************************/
+
+static int __init psm_md_init(void)
+{
+    printk(KERN_INFO "psm_md: loading module\n");
+
+    if (init_tr_pid_array() != 0)
+    {
+        printk(
+            KERN_CRIT "psm_md: cannot allocate memory for traced pids array (size %zu)\n",
+            DEFAULT_TRACED_PIDS_COUNT * sizeof(pid_t)
+        );
+        printk(KERN_CRIT "psm_md: module loading has been failed\n");
+
+        return -ENOMEM;
+    }
+
+    if (init_psi_array() != 0)
+    {
+        printk(
+            KERN_CRIT "psm_md: cannot allocate memory for proc slab info array (size %zu)\n",
+            DEFAULT_TRACED_PIDS_COUNT * sizeof(struct proc_slab_info)
+        );
+        printk(KERN_CRIT "psm_md: module loading has been failed\n");
+
+        free_traced_pid_array();
+
+        return -ENOMEM;
+    }
+
+    static const struct proc_ops fops =
+    {
+        .proc_open = psm_open,
+        .proc_read = psm_read,
+        .proc_write = psm_write,
+        .proc_release = psm_release
+    };
+
+    if (!proc_create(PROC_FILE_NAME, 0x666, NULL, &fops))
+    {
+        printk(KERN_CRIT "psm_md: cannot create %s file in proc\n", PROC_FILE_NAME);
+
+        free_traced_pid_array();
+        free_proc_slab_info_array();
+
+        return -EFAULT;
+    }
+
+    int rc = fh_install_hooks(hooks, 5);
+
+    if (rc != 0)
+    {
+        printk(KERN_CRIT "psm_md: cannot hook\n");
+        printk(KERN_CRIT "psm_md: module loading has been failed\n");
+
+        free_traced_pid_array();
+        free_proc_slab_info_array();
+
+        return -ENOMEM;
+    }
+
+    printk(KERN_INFO "psm_md: module has been loaded\n");
+
+    return 0;
+}
+
+static void __exit psm_md_exit(void)
+{
+    printk(KERN_INFO "psm_md: unloading module\n");
+
+    printk(KERN_INFO "psm_md: removing hooks\n");
+    fh_remove_hooks(hooks, 5);
+
+    printk(KERN_INFO "psm_md: removing proc file\n");
+    remove_proc_entry(PROC_FILE_NAME, NULL);
+
+    printk(KERN_INFO "psm_md: freeing pids and psi arrays\n");
+    free_traced_pid_array();
+    free_proc_slab_info_array();
+
+    printk(KERN_INFO "psm_md: module has been unloaded\n");
+}
+
+module_init(psm_md_init);
+module_exit(psm_md_exit);

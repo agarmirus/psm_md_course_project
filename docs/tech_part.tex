@@ -1,0 +1,423 @@
+\chapter{Технологическая часть}
+
+\section{Выбор языка и среды программирования}
+
+В качестве языка программирования был выбран язык C, поскольку для данного языка в операционной системе Linux имеется библиотека для разработки загружаемых модулей ядра.
+
+В качестве среды разработки был выбран графический редактор Visual Studio Code.
+
+\section{Описание структур}
+
+Для хранения информации об используемых процессами SLAB-кэшах используются структуры struct~proc\_slab\_info и struct~proc\_slab\_info\_array, объявления которых представлены в листингах~\ref{struct_proc_slab_info}~и~\ref{struct_proc_slab_info_array} соответственно.
+\begin{figure}[H]
+	\begin{lstlisting}[label=struct_proc_slab_info,caption=Объявление структуры struct~proc\_slab\_info,language=Caml]
+struct proc_slab_info
+{
+	pid_t pid;               /* PID процесса */
+	const char *cache_name;  /* имя кэша SLAB */
+	size_t num_objs;         /* число объектов в кэше SLAB, 
+	                            выделенных процессом */
+	size_t obj_size;         /* размер объекта кэша SLAB */
+	size_t objs_per_slab;    /* число объектов в одном slab */
+	size_t pages_per_slab;   /* число страниц в одном slab */
+};
+	\end{lstlisting}
+\end{figure}
+\begin{figure}[H]
+	\begin{lstlisting}[label=struct_proc_slab_info_array,caption=Объявление структуры struct~proc\_slab\_info\_array,language=Caml]
+struct proc_slab_info_array
+{
+	size_t buf_size;            /* размер буфера, выделенного под массив */
+	size_t length;              /* число элементов в массиве */
+	struct proc_slab_info *arr; /* массив с информацией об используемых
+	                               процессами кэшах SLAB */
+};
+	\end{lstlisting}
+\end{figure}
+
+Для хранения PID отслеживаемых процессов используется struct~traced\_pids\_array, объявление которой представлено в листинге~\ref{struct_traced_pids_array}.
+\begin{figure}[H]
+	\begin{lstlisting}[label=struct_traced_pids_array,caption=Объявление структуры struct~traced\_pids\_array,language=Caml]
+struct traced_pids_array
+{
+	size_t buf_size;  /* размер буфера, выделенного под массив */
+	size_t length;    /* число элементов в массиве */
+	pid_t *arr;       /* массив PID процессов */
+};
+	\end{lstlisting}
+\end{figure}
+
+Для осуществления перехвата необходимых функций используется структура struct ftrace\_hook, объявление которой представлено в листинге~\ref{struct_ftrace_hook}.
+\begin{figure}[H]
+	\begin{lstlisting}[label=struct_ftrace_hook,caption=Объявление структуры struct~ftrace\_hook,language=Caml]
+struct ftrace_hook
+{
+	const char *name;       /* имя перехватываемой функции */
+	void *function;         /* указатель на функцию, вызываемую
+	                           вместо перехваченной функции */
+	void *original;         /* указатель на оригинальную функцию */
+	unsigned long address;  /* адрес оригинальной функции */
+	struct ftrace_ops ops;  /* используется для получения объекта
+	                           структуры struct ftrace_hook
+	                           в функции обратного вызова с помощью
+	                           макроса container_of */
+};
+	\end{lstlisting}
+\end{figure}
+
+\section{Реализация загружаемого модуля ядра}
+
+Исходный код загружаемого модуля ядра представлен в приложении А.
+
+В листингах~\ref{psm_md_init}~и~\ref{psm_md_exit} представлены функции загрузки и выгрузки загружаемого модуля ядра соответственно.
+%\begin{figure}[H]
+	\begin{lstlisting}[label=psm_md_init,caption=Функция загрузки ядра,language=Caml]
+static int __init psm_md_init(void)
+{
+	printk(KERN_INFO "psm_md: loading module\n");
+	if (init_tr_pid_array() != 0)
+	{
+		printk(
+			KERN_CRIT "psm_md: cannot allocate memory for traced pids array (size %zu)\n",
+			DEFAULT_TRACED_PIDS_COUNT * sizeof(pid_t)
+		);
+		printk(KERN_CRIT "psm_md: module loading has been failed\n");
+		return -ENOMEM;
+	}
+	if (init_psi_array() != 0)
+	{
+		printk(
+			KERN_CRIT "psm_md: cannot allocate memory for proc slab info array (size %zu)\n",
+			DEFAULT_TRACED_PIDS_COUNT * sizeof(struct proc_slab_info)
+		);
+		printk(KERN_CRIT "psm_md: module loading has been failed\n");
+		free_traced_pid_array();
+		return -ENOMEM;
+	}
+	static const struct proc_ops fops =
+	{
+		.proc_open = psm_open,
+		.proc_read = psm_read,
+		.proc_write = psm_write,
+		.proc_release = psm_release
+	};
+	if (!proc_create(PROC_FILE_NAME, 0x666, NULL, &fops))
+	{
+		printk(KERN_CRIT "psm_md: cannot create %s file in proc\n", PROC_FILE_NAME);
+		free_traced_pid_array();
+		free_proc_slab_info_array();
+		return -EFAULT;
+	}
+	int rc = fh_install_hooks(hooks, 5);
+	if (rc != 0)
+	{
+		printk(KERN_CRIT "psm_md: cannot hook\n");
+		printk(KERN_CRIT "psm_md: module loading has been failed\n");
+		free_traced_pid_array();
+		free_proc_slab_info_array();
+		return -ENOMEM;
+	}
+	printk(KERN_INFO "psm_md: module has been loaded\n");
+	return 0;
+}
+	\end{lstlisting}
+%\end{figure}
+\begin{figure}[H]
+\begin{lstlisting}[label=psm_md_exit,caption=Функция выгрузки ядра,language=Caml]
+static void __exit psm_md_exit(void)
+{
+	printk(KERN_INFO "psm_md: unloading module\n");
+	printk(KERN_INFO "psm_md: removing hooks\n");
+	fh_remove_hooks(hooks, 5);
+	printk(KERN_INFO "psm_md: removing proc file\n");
+	remove_proc_entry(PROC_FILE_NAME, NULL);
+	printk(KERN_INFO "psm_md: freeing pids and psi arrays\n");
+	free_traced_pid_array();
+	free_proc_slab_info_array();
+	printk(KERN_INFO "psm_md: module has been unloaded\n");
+}
+\end{lstlisting}
+\end{figure}
+
+В листингах~\ref{fh_in_kmem_cache_alloc_node}~--~\ref{fh_kmem_cache_destroy} представлены оберточные функции для \_\_kmem\_cache\_alloc\_node, \_\_kmem\_cache\_free, kmem\_cache\_alloc, kmem\_cache\_free и kmem\_cache\_destroy соответственно.
+\begin{figure}[H]
+	\begin{lstlisting}[label=fh_in_kmem_cache_alloc_node,caption=Оберточная функция для \_\_kmem\_cache\_alloc\_node,language=Caml]
+static void *( *real_in_kmem_cache_alloc_node)(
+	struct kmem_cache *,
+	gfp_t,
+	int,
+	size_t,
+	unsigned long
+);
+
+static void *fh_in_kmem_cache_alloc_node(
+	struct kmem_cache *cachep,
+	gfp_t flags,
+	int nodeid,
+	size_t orig_size,
+	unsigned long caller
+)
+{
+	void *ret = real_in_kmem_cache_alloc_node(cachep, flags, nodeid, orig_size, caller);
+	if (traced_pid_ind(current->pid) != -1)
+	{
+		printk(KERN_INFO "psm_md: catched __kmem_cache_alloc_node call from %d\n", current->pid);
+		if (ret)
+			commit_kmem_cache_alloc(cachep);
+	}
+	return ret;
+}
+	\end{lstlisting}
+\end{figure}
+\begin{figure}[H]
+	\begin{lstlisting}[label=fh_in_kmem_cache_free,caption=Оберточная функция для \_\_kmem\_cache\_free,language=Caml]
+static void ( *real_in_kmem_cache_free)(
+	struct kmem_cache *,
+	void *,
+	unsigned long
+);
+
+static void fh_in_kmem_cache_free(
+	struct kmem_cache *cachep,
+	void *objp,
+	unsigned long caller
+)
+{
+	real_in_kmem_cache_free(cachep, objp, caller);
+	if (traced_pid_ind(current->pid) != -1)
+	{
+		printk(KERN_INFO "psm_md: catched __kmem_cache_free call from %d\n", current->pid);
+		if (objp)
+			commit_kmem_cache_free(cachep);
+	}
+}
+	\end{lstlisting}
+\end{figure}
+\begin{figure}[H]
+	\begin{lstlisting}[label=fh_kmem_cache_alloc,caption=Оберточная функция для kmem\_cache\_alloc,language=Caml]
+static void *( *real_kmem_cache_alloc)(struct kmem_cache *, gfp_t);
+
+static void *fh_kmem_cache_alloc(struct kmem_cache *cachep, gfp_t flags)
+{
+	void *ret = real_kmem_cache_alloc(cachep, flags);
+	if (traced_pid_ind(current->pid) != -1)
+	{
+		printk(KERN_INFO "psm_md: catched kmem_cache_alloc call from %d\n", current->pid);
+		
+		if (ret)
+			commit_kmem_cache_alloc(cachep);
+	}
+	return ret;
+}
+	\end{lstlisting}
+\end{figure}
+\begin{figure}[H]
+	\begin{lstlisting}[label=fh_kmem_cache_free,caption=Оберточная функция для kmem\_cache\_free,language=Caml]
+static void ( *real_kmem_cache_free)(struct kmem_cache *, void *);
+
+static void fh_kmem_cache_free(struct kmem_cache *cachep, void *objp)
+{
+	real_kmem_cache_free(cachep, objp);
+	if (traced_pid_ind(current->pid) != -1)
+	{
+		printk(KERN_INFO "psm_md: catched kmem_cache_free call from %d\n", current->pid);
+		if (objp)
+			commit_kmem_cache_free(cachep);
+	}
+}
+	\end{lstlisting}
+\end{figure}
+\begin{figure}[H]
+	\begin{lstlisting}[label=fh_kmem_cache_destroy,caption=Оберточная функция для kmem\_cache\_destroy,language=Caml]
+static void ( *real_kmem_cache_destroy)(struct kmem_cache *);
+
+static void fh_kmem_cache_destroy(struct kmem_cache *cachep)
+{
+	real_kmem_cache_destroy(cachep);
+	printk(KERN_INFO "psm_md: catched kmem_cache_destroy call from %d\n", current->pid);
+	if (cachep)
+		commit_kmem_cache_destroy(cachep);
+}
+	\end{lstlisting}
+\end{figure}
+
+Процедуры commit\_kmem\_cache\_alloc, commit\_kmem\_cache\_free и commit\_kmem\_cache\-\_destroy представлены в листингах~\ref{commit_kmem_cache_alloc},\ref{commit_kmem_cache_free} и \ref{commit_kmem_cache_destroy} соответственно.
+%\begin{figure}[H]
+	\begin{lstlisting}[label=commit_kmem_cache_alloc,caption=Процедура commit\_kmem\_cache\_alloc,language=Caml]
+static void commit_kmem_cache_alloc(const struct kmem_cache *const cachep)
+{
+	const char *cache_name = get_kmem_cache_name(cachep);
+	int ind = proc_slab_info_ind(current->pid, cache_name);
+	if (ind == -1)
+	{
+		struct proc_slab_info new_psi =
+		{
+			.pid = current->pid,
+			.cache_name = cache_name,
+			.num_objs = 0,
+			.obj_size = get_kmem_cache_object_size(cachep),
+			.objs_per_slab = get_kmem_cache_objs_per_slab(cachep),
+			.pages_per_slab = get_kmem_cache_pages_per_slab(cachep)
+		};
+		if (add_proc_slab_info(&new_psi) != 0)
+			return;
+		ind = psi_array.length - 1;
+	}
+	++psi_array.arr[ind].num_objs;
+}
+	\end{lstlisting}
+%\end{figure}
+\begin{figure}[H]
+\begin{lstlisting}[label=commit_kmem_cache_free,caption=Процедура commit\_kmem\_cache\_free,language=Caml]
+static void commit_kmem_cache_free(const struct kmem_cache *const cachep)
+{
+	const char *cache_name = get_kmem_cache_name(cachep);
+	int ind = proc_slab_info_ind(current->pid, cache_name);
+	if (ind != -1 && psi_array.arr[ind].num_objs > 0)
+		--psi_array.arr[ind].num_objs;
+}
+\end{lstlisting}
+\end{figure}
+\begin{figure}[H]
+	\begin{lstlisting}[label=commit_kmem_cache_destroy,caption=Процедура commit\_kmem\_cache\_destroy,language=Caml]
+static void commit_kmem_cache_destroy(struct kmem_cache *cachep)
+{
+	size_t i = 0;
+	while (i < psi_array.length)
+	{
+		if (strcmp(psi_array.arr[i].cache_name, get_kmem_cache_name(cachep)) == 0)
+		{
+			for (size_t j = i; j < psi_array.length; ++j)
+				psi_array.arr[j] = psi_array.arr[i + 1];
+			--psi_array.length;
+		}
+		else
+			++i;
+	}
+}
+	\end{lstlisting}
+\end{figure}
+
+В листингах~\ref{psm_read}~и~\ref{psm_write} представлены функции для чтения и записи в файл в виртуальной файловой системе proc соответственно.
+\begin{figure}[H]
+	\begin{lstlisting}[label=psm_read,caption=Функция psm\_read,language=Caml]
+static ssize_t psm_read(struct file *file, char __user *buf, size_t len, loff_t *fPos)
+{
+	printk(KERN_INFO "psm_md: read has been called (PID %d)\n", current->pid);
+	if ( *fPos >= psi_array.length) return 0;
+	char line_buf[500] = {0};
+	pid_t pid = psi_array.arr[*fPos].pid;
+	const char *cache_name = psi_array.arr[*fPos].cache_name;
+	size_t num_objs = psi_array.arr[*fPos].num_objs;
+	size_t objs_per_slab = psi_array.arr[*fPos].objs_per_slab;
+	size_t pages_per_slab = psi_array.arr[*fPos].pages_per_slab;
+	size_t obj_size = psi_array.arr[*fPos].obj_size;
+	size_t slabs_count = num_objs / objs_per_slab + (num_objs % objs_per_slab > 0);
+	size_t total_pages = slabs_count * pages_per_slab;
+	if ( *fPos == 0)
+		sprintf(
+			line_buf,
+			"pid   "
+			"name                 "
+			"num_objs   "
+			"obj_size   "
+			"objs_per_slab "
+			"pages_per_slab "
+			"total_pages\n"
+			"%-5d %-20s %-10zu %-10zu %-13zu %-15zu %-11zu\n",
+			pid, cache_name,
+			num_objs, obj_size,
+			objs_per_slab, pages_per_slab,
+			total_pages
+		);
+	else
+		sprintf(
+			line_buf,
+			"%-5d %-20s %-10zu %-10zu %-13zu %-15zu %-11zu\n",
+			pid, cache_name,
+			num_objs, obj_size,
+			objs_per_slab, pages_per_slab,
+			total_pages
+		);
+	if (copy_to_user(buf, line_buf, strlen(line_buf) + 1) == -1)
+	{
+		printk(KERN_ERR "psm_md: copy_to_user error\n");
+		return -EFAULT;
+	}
+	++( *fPos);
+	return strlen(line_buf) + 1;
+}
+	\end{lstlisting}
+\end{figure}
+\begin{figure}[H]
+	\begin{lstlisting}[label=psm_write,caption=Функция psm\_write,language=Caml]
+static ssize_t psm_write(struct file *file, const char __user *buf, size_t len, loff_t *fPos)
+{
+	printk(KERN_INFO "psm_md: write has been called (PID %d)\n", current->pid);
+	char tmp_buf[10] = {0};
+	if (copy_from_user(tmp_buf, buf, len) == -1)
+	{
+		printk(KERN_ERR "psm_md: copy_from_user error (PID %d)\n", current->pid);
+		return -EFAULT;
+	}
+	pid_t pid = -1;
+	printk(KERN_INFO "psm_md: parsing input string (PID %d)\n", current->pid);
+	if (tmp_buf[0] == 'r')
+	{
+		int rc = kstrtol(tmp_buf + 1, 10, (long *)&pid);
+		if (rc != 0)
+		{
+			printk(KERN_ERR "psm_md: invalid pid\n");
+			return -EIO;
+		}
+		printk(KERN_INFO "psm_md: removing pid %d (PID %d)\n", pid, current->pid);
+		remove_traced_pid(pid);
+	}
+	else
+	{
+		int rc = kstrtol(tmp_buf, 10, (long *)&pid);
+		if (rc != 0)
+		{
+			printk(KERN_ERR "psm_md: invalid pid\n");
+			return -EIO;
+		}
+		printk(KERN_INFO "psm_md: adding pid %d (PID %d)\n", pid, current->pid);
+		rc = add_traced_pid(pid);
+		if (rc != 0)
+		{
+			printk(KERN_ERR "psm_md: error while adding traced pid\n");
+			return -ENOMEM;
+		}
+	}
+	return len;
+}
+	\end{lstlisting}
+\end{figure}
+
+В листинге~\ref{make} представлено содержимое make-файла для сборки загружаемого модуля ядра.
+\begin{figure}[H]
+	\begin{lstlisting}[label=make,caption=Make-файл для сборки загружаемого модуля ядра,language=Caml]
+CURRENT = $(shell uname -r)
+KDIR = /lib/modules/$(CURRENT)/build
+PWD = $(shell pwd)
+
+obj-m := psm_md.o
+
+default: 
+	make -C $(KDIR) M=$(PWD) modules 
+clean: 
+	@rm -f *.o .*.cmd .*.flags *.mod.c *.order *.mod *.ko *.symvers 
+	@rm -f .*.*.cmd *~ *.*~ TODO.* .*.d
+	@rm -fR .tmp* 
+	@rm -rf .tmp_versions 
+	disclean: clean 
+	@rm *.ko *.symvers
+	\end{lstlisting}
+\end{figure}
+
+\section*{Вывод}
+
+Были разработаны реализации алгоритмов загрузки и выгрузки разрабатываемого загружаемого модуля ядра, алгоритмы перехвата функции, чтения и записи для файла в виртуальной файловой системе proc и алгоритмы необходимых подменяемых функций.
+Был разработан make-файл для сборки загружаемого модуля ядра.
+
+\clearpage
